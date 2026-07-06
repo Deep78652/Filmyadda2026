@@ -238,6 +238,8 @@ async def process_and_send_update(bot, filename, caption):
             finally:
                 await asyncio.sleep(12)
                 POSTED_MOVIES.discard(movie_key)
+                if base_name in locks:
+                    del locks[base_name]
                 
     except Exception as e:
         logger.exception(f"Processing execution failed: {e}")
@@ -276,8 +278,29 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
             except ValueError:
                 pass
 
-        year_val = details.get("year") or media_info["year"]
+        year_val = media_info["year"]
+        if not year_val and details.get("year"):
+            year_val = str(details.get("year")).strip()
+        
         is_series = (media_info["tag"] == "#SERIES")
+        if not year_val and is_series:
+            try:
+                session = await get_session()
+                encoded_query = urllib.parse.quote(base_name)
+                search_url = f"https://v3-cinemeta.strem.io/catalog/series/top/search={encoded_query}.json"
+                async with session.get(search_url, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        metas = data.get("metas", [])
+                        if metas and metas[0].get("year"):
+                            raw_year = metas[0].get("year")
+                            year_match = re.search(r'\b(19\d{2}|20\d{2})\b', str(raw_year))
+                            if year_match:
+                                year_val = year_match.group(1)
+            except Exception as e:
+                logger.error(f"Error fetching series year from Cinemeta: {e}")
+
+        year_val = year_val or None
         final_poster = await get_landscape_poster_only(base_name, is_series)
 
         existing_movie = await db.movie_updates.find_one({"_id": base_name})
@@ -391,9 +414,8 @@ async def send_movie_update(bot, base_name, is_update=False):
                     await asyncio.sleep(e.value)
                     return await send_movie_update(bot, base_name, is_update)
 
-        # 🛠️ [AI DOUBLE CHECK TRIGGER]: ਪੋਸਟ ਹੁੰਦੇ ਸਾਰ ਹੀ AI ਵੈਰੀਫਿਕੇਸ਼ਨ ਚਲਾਓ
         if sent_msg and hasattr(sent_msg, 'id'):
-            asyncio.create_task(verify_and_correct_post_with_ai(bot, sent_msg.id, movie_doc, base_name, buttons))
+            asyncio.create_task(verify_and_correct_post_with_ai(bot, sent_msg.id, base_name, buttons))
             return sent_msg
                 
     except Exception as e:
@@ -402,41 +424,23 @@ async def send_movie_update(bot, base_name, is_update=False):
 
 # ============ AI DOUBLE CHECK & AUTO CORRECTION ENGINE ============
 
-async def verify_and_correct_post_with_ai(bot, message_id: int, movie_doc: dict, base_name: str, buttons):
-    """ਪੋਸਟ ਹੋਏ ਮੈਸੇਜ ਨੂੰ AI ਰਾਹੀਂ ਦੁਬਾਰਾ ਚੈੱਕ ਕਰਕੇ ਗਲਤੀਆਂ ਨੂੰ ਮੌਕੇ 'ਤੇ ਹੀ ਠੀਕ ਕਰਨਾ"""
+async def verify_and_correct_post_with_ai(bot, message_id: int, base_name: str, buttons):
     try:
-        await asyncio.sleep(1) # ਪੋਸਟ ਹੋਣ ਤੋਂ ਤੁਰੰਤ 1 ਸੈਕੰਡ ਬਾਅਦ ਚੈੱਕ ਕਰੋ
+        await asyncio.sleep(1) 
         
-        # 1. ਡਾਟਾਬੇਸ ਤੋਂ ਸਹੀ ਜਾਣਕਾਰੀ ਮੁੜ ਚੈੱਕ ਕਰੋ
-        rating_raw = movie_doc.get("rating", "N/A")
-        rating_str = f"{rating_raw}/10" if rating_raw != "N/A" else "N/A"
+        movie_doc = await db.movie_updates.find_one({"_id": base_name})
+        if not movie_doc:
+            return
+
+        correct_text = generate_movie_message(movie_doc, base_name)
         
-        all_languages = set()
-        for file in movie_doc.get("files", []):
-            if file.get("language") and file["language"] != "N/A":
-                all_languages.update(l.strip() for l in file["language"].split(",") if l.strip())
-        language_str = " ".join(f"#{lang}" for lang in sorted(all_languages)) if all_languages else "#Hindi"
-        
-        title = base_name.upper()
-        year_val = str(movie_doc.get("year", "")).strip()
-        year_val = re.sub(r'[()\[\]]', '', year_val)
-        year_str = f" ({year_val})" if year_val and year_val not in title else ""
-        
-        # 2. ਅਸਲੀ ਟੈਕਸਟ ਜੋ ਹੋਣਾ ਚਾਹੀਦਾ ਹੈ
-        correct_text = (
-            f"🎬 <code>{title}{year_str}</code>\n"
-            f"<i>📌 (Touch To Copy)</i>\n\n"
-            f"⭐ IMDb: {rating_str}\n\n"
-            f"➡ Audio Track:- 🔊 {language_str}\n\n"
-            f"Added ✅"
-        )
-        
-        # 3. ਚੈਨਲ ਵਿੱਚੋਂ ਲਾਈਵ ਪੋਸਟ ਨੂੰ ਮੰਗਵਾਓ
         try:
             live_msg = await bot.get_messages(chat_id=MOVIE_UPDATE_CHANNEL, message_ids=message_id)
+            if isinstance(live_msg, list) and live_msg:
+                live_msg = live_msg[0]
+                
             live_text = live_msg.caption if movie_doc.get("poster_url") else live_msg.text
             
-            # 4. ਜੇਕਰ ਲਾਈਵ ਟੈਕਸਟ ਵਿੱਚ ਕੋਈ ਗਲਤੀ ਹੈ, ਤਾਂ AI ਉਸਨੂੰ ਤੁਰੰਤ ਠੀਕ ਕਰੇਗਾ
             if live_text and live_text.strip() != correct_text.strip():
                 logger.info(f"🔎 AI detected a mismatch in post ID {message_id}. Correcting automatically...")
                 if movie_doc.get("poster_url"):
@@ -476,7 +480,7 @@ def generate_movie_message(movie_doc, base_name) -> str:
     year_val = str(movie_doc.get("year", "")).strip()
     year_val = re.sub(r'[()\[\]]', '', year_val)
     
-    year_str = f" ({year_val})" if year_val and year_val not in title else ""
+    year_str = f" ({year_val})" if year_val and year_val != "None" and year_val not in title else ""
     rating_raw = movie_doc.get("rating", "N/A")
     rating_str = f"{rating_raw}/10" if rating_raw != "N/A" else "N/A"
     
