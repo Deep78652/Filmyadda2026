@@ -2,15 +2,20 @@ import re
 import logging
 import asyncio
 import aiohttp
-import html  
+import html
+import io
+import textwrap
 from datetime import datetime
 from collections import defaultdict
 import urllib.parse
 from typing import Optional, Tuple, Dict, List
 from bs4 import BeautifulSoup
 
+# Pillow (PIL) for image editing
+from PIL import Image, ImageDraw, ImageFont
+
 from pyrogram import Client, filters, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from pyrogram.errors import MessageIdInvalid, MessageNotModified, FloodWait
 from pymongo.errors import PyMongoError, DuplicateKeyError
 
@@ -23,7 +28,7 @@ from Script import script
 from info import (
     CHANNELS, MOVIE_UPDATE_CHANNEL, LINK_PREVIEW, ABOVE_PREVIEW, 
     BAD_WORDS, LANDSCAPE_POSTER, TMDB_POSTER, NOR_IMG, IMDB_TEMPLATE,
-    TMDB_API_KEY  # ✅ API Key info.py ਤੋਂ import ਕੀਤੀ
+    TMDB_API_KEY
 )
 
 logger = logging.getLogger(__name__)
@@ -102,15 +107,72 @@ QUALITY_PATTERN = re.compile(
 YEAR_PATTERN = re.compile(r"(?<![A-Za-z0-9])(19\d{2}|20\d{2})(?![A-Za-z0-9])")
 EPISODE_CLEAN_PATTERN = re.compile(r'\b(S\d{1,2}|E\d{1,3}|Ep\d{1,3}|Episode\s*\d{1,3}|Season\s*\d{1,2}|Part\s*\d{1,2}|\d{1,2}\s*-\s*\d{1,2}|\d{1,3}\s*to\s*\d{1,3})\b', re.IGNORECASE)
 
-# ============ LANGUAGE EXTRACTION WITH REGEX WORD BOUNDARIES ============
-LANG_PATTERN = re.compile(
-    r'\b(?:hin|hindi|tam|tamil|kan|kannada|tel|telugu|mal|malayalam|'
-    r'eng|english|pun|punjabi|ben|bengali|mar|marathi|guj|gujarati|'
-    r'urd|urdu|kor|korean|jpn|japanese)\b',
-    re.IGNORECASE
-)
-
 MEDIA_FILTER = filters.document | filters.video | filters.audio
+
+# ============ NEW: CREATE TITLE-ONLY POSTER ============
+
+async def create_title_only_poster(backdrop_url: str, title: str) -> Optional[bytes]:
+    """
+    backdrop_url ਤੋਂ ਇਮੇਜ ਡਾਊਨਲੋਡ ਕਰੋ, ਉਸ 'ਤੇ ਸਿਰਫ਼ ਟਾਈਟਲ (ਵੱਡਾ, ਚਿੱਟਾ, ਸੈਂਟਰਡ) ਲਿਖੋ।
+    ਜੇਕਰ backdrop ਨਾ ਮਿਲੇ, ਤਾਂ None ਵਾਪਸ ਕਰੋ।
+    """
+    try:
+        # 1. Backdrop ਡਾਊਨਲੋਡ
+        async with aiohttp.ClientSession() as session:
+            async with session.get(backdrop_url) as resp:
+                if resp.status != 200:
+                    return None
+                img_data = await resp.read()
+        
+        # 2. PIL Image ਖੋਲ੍ਹੋ
+        image = Image.open(io.BytesIO(img_data)).convert("RGBA")
+        img_w, img_h = image.size
+        
+        # 3. Draw object
+        draw = ImageDraw.Draw(image)
+        
+        # 4. ਫੌਂਟ ਲੋਡ ਕਰੋ (Bold, ਵੱਡਾ)
+        try:
+            font_size = int(img_w * 0.10)  # 10% of width
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+            font_size = 20
+        
+        # 5. ਟਾਈਟਲ ਨੂੰ wrap ਕਰੋ
+        wrapped_title = textwrap.fill(title.upper(), width=14)
+        
+        # 6. ਟੈਕਸਟ ਦਾ size ਮਾਪੋ
+        bbox = draw.textbbox((0, 0), wrapped_title, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        
+        # 7. Center coordinates
+        x = (img_w - text_w) // 2
+        y = (img_h - text_h) // 2 - int(text_h * 0.2)
+        
+        # 8. Background overlay (semi-transparent black for readability)
+        overlay = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        padding = 25
+        overlay_draw.rectangle(
+            [x - padding, y - padding, x + text_w + padding, y + text_h + padding],
+            fill=(0, 0, 0, 170)
+        )
+        image = Image.alpha_composite(image, overlay)
+        draw = ImageDraw.Draw(image)
+        
+        # 9. White text
+        draw.text((x, y), wrapped_title, font=font, fill=(255, 255, 255, 255))
+        
+        # 10. Bytes output
+        output = io.BytesIO()
+        image.convert("RGB").save(output, format="JPEG", quality=92)
+        return output.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Title-only poster generation failed: {e}")
+        return None
 
 # ============ AI & OFFICIAL LANDSCAPE VALIDATION SYSTEM ============
 
@@ -173,10 +235,8 @@ def remove_ignored_words(text: str) -> str:
     return " ".join(cleaned_words)
 
 def extract_languages_from_text(text: str) -> set:
-    """Regex word boundaries ਨਾਲ ਭਾਸ਼ਾਵਾਂ ਲੱਭੋ — ਗਲਤ ਸਬ-ਸਟ੍ਰਿੰਗ ਨਾਲ ਗੜਬੜੀ ਨਹੀਂ ਹੋਵੇਗੀ"""
     found = set()
     text_lower = text.lower()
-    # ਪਹਿਲਾਂ CAPTION_LANGUAGES ਦੀਆਂ ਕੁੰਜੀਆਂ ਨਾਲ word boundary match
     for lang_key, lang_name in CAPTION_LANGUAGES.items():
         if re.search(rf'\b{re.escape(lang_key)}\b', text_lower):
             found.add(lang_name)
@@ -194,7 +254,6 @@ def extract_media_info(filename: str, caption: str):
     quality_str = ", ".join(quality) if quality else "N/A"
     ott_platform = extract_ott_platform(f"{filename_normalized} {caption_clean}")
 
-    # ✅ Regex word boundaries ਨਾਲ ਭਾਸ਼ਾ ਡਿਟੈਕਟ ਕਰੋ
     lang_set = set()
     lang_set.update(extract_languages_from_text(filename_normalized))
     lang_set.update(extract_languages_from_text(caption_clean))
@@ -217,6 +276,11 @@ def extract_media_info(filename: str, caption: str):
     base_name = normalize(remove_ignored_words(base_raw))
     if not base_name:
         base_name = filename_normalized
+
+    # [FIX] For series, remove season number to group all episodes together
+    if tag == "#SERIES":
+        base_name = re.sub(r'\bS\d{1,2}\b', '', base_name, flags=re.IGNORECASE).strip()
+        base_name = normalize(base_name)
 
     return {
         "processed": filename_normalized,
@@ -304,7 +368,6 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 if not details or details.get("error"):
                     error_tmdb = True
                 else:
-                    # TMDB ਤੋਂ original_language ਲਓ
                     orig_lang = details.get("original_language") or details.get("lang")
                     if orig_lang:
                         tmdb_language_override = TMDB_LANG_MAP.get(orig_lang.lower())
@@ -345,28 +408,24 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
 
         year_val = year_val or None
         
-        # ✅ Language: TMDB original_language ਨੂੰ ਪ੍ਰਾਥਮਿਕਤਾ ਦਿਓ, ਫਿਰ file/caption ਤੋਂ
+        # ✅ Language: TMDB original_language ਨੂੰ ਪ੍ਰਾਥਮਿਕਤਾ
         final_language = media_info["language"]
         if tmdb_language_override and tmdb_language_override != "N/A":
-            # ਜੇ TMDB ਭਾਸ਼ਾ ਮਿਲੀ ਹੈ, ਤਾਂ ਉਸ ਨੂੰ ਪਹਿਲ ਦਿਓ
             if final_language == "N/A" or final_language == "Hindi" or len(final_language.split(",")) <= 1:
                 final_language = tmdb_language_override
             else:
-                # ਜੇ ਪਹਿਲਾਂ ਤੋਂ ਹੀ ਕਈ ਭਾਸ਼ਾਵਾਂ ਹਨ, ਤਾਂ TMDB ਵਾਲੀ ਨੂੰ ਜੋੜ ਦਿਓ (ਜੇ ਡੁਪਲੀਕੇਟ ਨਾ ਹੋਵੇ)
                 existing = set(l.strip() for l in final_language.split(","))
                 existing.add(tmdb_language_override)
                 final_language = ", ".join(sorted(existing))
         elif final_language == "N/A":
-            # ਕੋਈ ਭਾਸ਼ਾ ਨਾ ਮਿਲੀ, ਤਾਂ ਡਿਫਾਲਟ Hindi ਲਗਾਓ
             final_language = "Hindi"
         
-        # Update file_data with final language
         file_data["language"] = final_language
         
         final_poster = await get_landscape_poster_only(base_name, is_series)
 
         if not final_poster:
-            logger.info(f"❌ Poster NOT found for '{base_name}'. Skipping post creation to avoid text-only updates.")
+            logger.info(f"❌ Poster NOT found for '{base_name}'. Skipping post creation.")
             return
 
         existing_movie = await db.movie_updates.find_one({"_id": base_name})
@@ -380,7 +439,6 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 update_fields["year"] = year_val
             if not existing_movie.get("poster_url") and final_poster:
                 update_fields["poster_url"] = final_poster
-            # ✅ Language update ਜੇਕਰ ਪੁਰਾਣੀ language N/A ਹੈ ਜਾਂ ਗਲਤ ਹੈ
             if existing_movie.get("language") != final_language and final_language != "N/A":
                 update_fields["language"] = final_language
 
@@ -419,7 +477,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
     except Exception as e:
         logger.error(f"Error in backend lock verification process: {e}")
 
-# ============ SEND MOVIE UPDATE ============
+# ============ SEND MOVIE UPDATE (FIXED FOR SERIES) ============
 
 async def send_movie_update(bot, base_name, is_update=False):
     try:
@@ -436,25 +494,83 @@ async def send_movie_update(bot, base_name, is_update=False):
             return None
 
         sent_msg = None
+
+        # --- UPDATE CASE (New Episode) ---
         if is_update and movie_doc.get("message_id"):
+            # Generate new poster with title overlay
+            image_bytes = await create_title_only_poster(poster_url, base_name)
+            if image_bytes:
+                media = InputMediaPhoto(media=image_bytes, caption=text, parse_mode=enums.ParseMode.HTML)
+                try:
+                    sent_msg = await bot.edit_message_media(
+                        chat_id=MOVIE_UPDATE_CHANNEL,
+                        message_id=movie_doc["message_id"],
+                        media=media,
+                        reply_markup=buttons
+                    )
+                except MessageNotModified:
+                    sent_msg = movie_doc
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    return await send_movie_update(bot, base_name, is_update)
+                except MessageIdInvalid:
+                    logger.warning(f"Message ID invalid for {base_name}, will send new.")
+                    is_update = False  # fallback to new send
+                except Exception as e:
+                    logger.error(f"Edit media error: {e}")
+                    # Try to at least update caption
+                    try:
+                        sent_msg = await bot.edit_message_caption(
+                            chat_id=MOVIE_UPDATE_CHANNEL,
+                            message_id=movie_doc["message_id"],
+                            caption=text,
+                            reply_markup=buttons,
+                            parse_mode=enums.ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+            else:
+                # Fallback: only caption
+                try:
+                    sent_msg = await bot.edit_message_caption(
+                        chat_id=MOVIE_UPDATE_CHANNEL,
+                        message_id=movie_doc["message_id"],
+                        caption=text,
+                        reply_markup=buttons,
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                except MessageNotModified:
+                    sent_msg = movie_doc
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    return await send_movie_update(bot, base_name, is_update)
+                except Exception as e:
+                    logger.error(f"Caption edit failed: {e}")
+                    return None
+            
+            if sent_msg:
+                return sent_msg
+            else:
+                # If editing failed completely, DO NOT send new post (avoid duplicates)
+                logger.warning(f"Update failed for {base_name}, not creating duplicate.")
+                return None
+
+        # --- NEW POST CASE ---
+        image_bytes = await create_title_only_poster(poster_url, base_name)
+        if image_bytes:
             try:
-                sent_msg = await bot.edit_message_caption(
+                sent_msg = await bot.send_photo(
                     chat_id=MOVIE_UPDATE_CHANNEL,
-                    message_id=movie_doc["message_id"],
+                    photo=image_bytes,
                     caption=text,
                     reply_markup=buttons,
                     parse_mode=enums.ParseMode.HTML
                 )
-            except MessageNotModified:
-                sent_msg = movie_doc
-            except MessageIdInvalid:
-                pass
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 return await send_movie_update(bot, base_name, is_update)
-
-        if not sent_msg:
-            try:
+            except Exception as e:
+                logger.error(f"New send failed: {e}")
                 sent_msg = await bot.send_photo(
                     chat_id=MOVIE_UPDATE_CHANNEL,
                     photo=poster_url,
@@ -462,17 +578,20 @@ async def send_movie_update(bot, base_name, is_update=False):
                     reply_markup=buttons,
                     parse_mode=enums.ParseMode.HTML
                 )
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-                return await send_movie_update(bot, base_name, is_update)
-            except Exception as img_err:
-                logger.error(f"Poster download failed on telegram server side ({img_err}). Skipping post creation entirely.")
-                return None
+        else:
+            sent_msg = await bot.send_photo(
+                chat_id=MOVIE_UPDATE_CHANNEL,
+                photo=poster_url,
+                caption=text,
+                reply_markup=buttons,
+                parse_mode=enums.ParseMode.HTML
+            )
 
         if sent_msg and hasattr(sent_msg, 'id'):
+            await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": sent_msg.id}})
             asyncio.create_task(verify_and_correct_post_with_ai(bot, sent_msg.id, base_name, buttons))
             return sent_msg
-                
+
     except Exception as e:
         logger.error(f"Failed to push update layout: {e}")
     return None
@@ -481,8 +600,7 @@ async def send_movie_update(bot, base_name, is_update=False):
 
 async def verify_and_correct_post_with_ai(bot, message_id: int, base_name: str, buttons):
     try:
-        # ✅ 1 ਮਿੰਟ (60 ਸਕਿੰਟ) ਬਾਅਦ ਚੈੱਕ ਕਰੋ
-        await asyncio.sleep(60)
+        await asyncio.sleep(60)  # 1 ਮਿੰਟ ਬਾਅਦ
         
         movie_doc = await db.movie_updates.find_one({"_id": base_name})
         if not movie_doc or not movie_doc.get("poster_url"):
@@ -529,7 +647,6 @@ def generate_movie_message(movie_doc, base_name) -> str:
         if file.get("language") and file["language"] != "N/A":
             all_languages.update(l.strip() for l in file["language"].split(",") if l.strip())
     
-    # ✅ ਜੇਕਰ movie_doc ਵਿੱਚ language ਸਟੋਰ ਹੈ, ਤਾਂ ਉਸ ਨੂੰ ਵੀ ਲਵਾਂ
     if movie_doc.get("language") and movie_doc["language"] != "N/A":
         all_languages.update(l.strip() for l in movie_doc["language"].split(",") if l.strip())
     
@@ -542,11 +659,10 @@ def generate_movie_message(movie_doc, base_name) -> str:
     year_val = str(movie_doc.get("year", "")).strip()
     year_val = re.sub(r'[()\[\]]', '', year_val)
     
-    # [FIX] ਚੈੱਕ ਕਰੋ ਕਿ ਪੋਸਟ ਸੀਰੀਜ਼ (#SERIES) ਦੀ ਹੈ ਜਾਂ ਨਹੀਂ। ਜੇ ਸੀਰੀਜ਼ ਹੈ ਤਾਂ ਸਾਲ (Year) ਨਾ ਲਗਾਓ।
     is_series = (movie_doc.get("tag") == "#SERIES")
     
     if is_series:
-        year_str = ""  # ਵੈੱਬ ਸੀਰੀਜ਼/ਐਪੀਸੋਡਸ ਲਈ ਸਾਲ ਬਿਲਕੁਲ ਗਾਇਬ
+        year_str = ""
     else:
         year_str = f" ({html.escape(year_val)})" if year_val and year_val != "None" and year_val not in title else ""
     
