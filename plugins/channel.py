@@ -45,6 +45,9 @@ POSTED_MOVIES = set()
 MAX_CACHE_SIZE = 500
 locks = defaultdict(asyncio.Lock)
 
+# New: Channel scan limit
+CHANNEL_SCAN_LIMIT = 500  # Number of recent messages to scan for duplicates
+
 IGNORE_WORDS = {
     "rarbg", "dub", "sub", "sample", "mkv", "aac", "combined", "mp4", "avi",
     "action", "adventure", "animation", "biography", "comedy", "crime", 
@@ -109,49 +112,35 @@ EPISODE_CLEAN_PATTERN = re.compile(r'\b(S\d{1,2}|E\d{1,3}|Ep\d{1,3}|Episode\s*\d
 
 MEDIA_FILTER = filters.document | filters.video | filters.audio
 
-# ============ NEW: CREATE TITLE-ONLY POSTER ============
+# ============ CREATE TITLE-ONLY POSTER ============
 
 async def create_title_only_poster(backdrop_url: str, title: str) -> Optional[bytes]:
-    """
-    backdrop_url ਤੋਂ ਇਮੇਜ ਡਾਊਨਲੋਡ ਕਰੋ, ਉਸ 'ਤੇ ਸਿਰਫ਼ ਟਾਈਟਲ (ਵੱਡਾ, ਚਿੱਟਾ, ਸੈਂਟਰਡ) ਲਿਖੋ।
-    ਜੇਕਰ backdrop ਨਾ ਮਿਲੇ, ਤਾਂ None ਵਾਪਸ ਕਰੋ।
-    """
+    """Download backdrop, overlay title text, return bytes."""
     try:
-        # 1. Backdrop ਡਾਊਨਲੋਡ
         async with aiohttp.ClientSession() as session:
             async with session.get(backdrop_url) as resp:
                 if resp.status != 200:
                     return None
                 img_data = await resp.read()
         
-        # 2. PIL Image ਖੋਲ੍ਹੋ
         image = Image.open(io.BytesIO(img_data)).convert("RGBA")
         img_w, img_h = image.size
-        
-        # 3. Draw object
         draw = ImageDraw.Draw(image)
         
-        # 4. ਫੌਂਟ ਲੋਡ ਕਰੋ (Bold, ਵੱਡਾ)
         try:
-            font_size = int(img_w * 0.10)  # 10% of width
+            font_size = int(img_w * 0.10)
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
         except:
             font = ImageFont.load_default()
             font_size = 20
         
-        # 5. ਟਾਈਟਲ ਨੂੰ wrap ਕਰੋ
         wrapped_title = textwrap.fill(title.upper(), width=14)
-        
-        # 6. ਟੈਕਸਟ ਦਾ size ਮਾਪੋ
         bbox = draw.textbbox((0, 0), wrapped_title, font=font)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
-        
-        # 7. Center coordinates
         x = (img_w - text_w) // 2
         y = (img_h - text_h) // 2 - int(text_h * 0.2)
         
-        # 8. Background overlay (semi-transparent black for readability)
         overlay = Image.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
         padding = 25
@@ -161,11 +150,8 @@ async def create_title_only_poster(backdrop_url: str, title: str) -> Optional[by
         )
         image = Image.alpha_composite(image, overlay)
         draw = ImageDraw.Draw(image)
-        
-        # 9. White text
         draw.text((x, y), wrapped_title, font=font, fill=(255, 255, 255, 255))
         
-        # 10. Bytes output
         output = io.BytesIO()
         image.convert("RGB").save(output, format="JPEG", quality=92)
         return output.getvalue()
@@ -174,14 +160,13 @@ async def create_title_only_poster(backdrop_url: str, title: str) -> Optional[by
         logger.error(f"Title-only poster generation failed: {e}")
         return None
 
-# ============ AI & OFFICIAL LANDSCAPE VALIDATION SYSTEM ============
+# ============ AI & OFFICIAL LANDSCAPE VALIDATION ============
 
 async def fetch_cinemeta_ai_poster(query: str, is_series: bool = False) -> Optional[str]:
     try:
         session = await get_session()
         m_type = "series" if is_series else "movie"
         encoded_query = urllib.parse.quote(query)
-        
         search_url = f"https://v3-cinemeta.strem.io/catalog/{m_type}/top/search={encoded_query}.json"
         async with session.get(search_url, timeout=10) as resp:
             if resp.status == 200:
@@ -242,26 +227,20 @@ def extract_languages_from_text(text: str) -> set:
             found.add(lang_name)
     return found
 
-# ============================
-# ✅ FIXED: Language only from filename, NOT from caption
-# ============================
 def extract_media_info(filename: str, caption: str):
+    """Extract base name, year, language, quality, etc. from filename only."""
     filename_cleaned = clean_mentions_links(filename)
     filename_normalized = normalize(filename_cleaned)
-    # caption_clean is NOT used for language extraction anymore
-    # caption_clean = clean_mentions_links(caption).lower() if caption else ""
 
     tag = "#MOVIE"
     year = None
     
     quality = QUALITY_PATTERN.findall(filename_normalized)
     quality_str = ", ".join(quality) if quality else "N/A"
-    ott_platform = extract_ott_platform(filename_normalized)  # caption removed
+    ott_platform = extract_ott_platform(filename_normalized)
 
     lang_set = set()
     lang_set.update(extract_languages_from_text(filename_normalized))
-    # ❌ removed caption language extraction
-    # lang_set.update(extract_languages_from_text(caption_clean))
     language = ", ".join(sorted(lang_set)) if lang_set else "N/A"
 
     if EPISODE_CLEAN_PATTERN.search(filename_normalized):
@@ -301,7 +280,38 @@ def extract_ott_platform(text: str) -> str:
     platforms = {plat for key, plat in OTT_PLATFORMS.items() if key in text}
     return " | ".join(platforms) if platforms else "N/A"
 
-# ============ MAIN HANDLERS ============
+# ================================================================
+# 🆕 NEW: SEARCH CHANNEL FOR EXISTING MOVIE POST (DUPLICATE CHECK)
+# ================================================================
+
+async def search_channel_for_movie(bot, base_name: str, year: Optional[str] = None) -> Optional[int]:
+    """
+    Scan the MOVIE_UPDATE_CHANNEL's recent messages to find if a post with the same
+    movie title (and optionally year) already exists.
+    Returns message_id if found, else None.
+    """
+    try:
+        chat_id = MOVIE_UPDATE_CHANNEL
+        title_pattern = re.escape(base_name.upper())
+        if year:
+            pattern = rf'(?:^|\s){title_pattern}(?:\s*\(\s*{re.escape(str(year))}\s*\))?'
+        else:
+            pattern = rf'(?:^|\s){title_pattern}'
+        compiled = re.compile(pattern, re.IGNORECASE)
+
+        async for message in bot.get_chat_history(chat_id, limit=CHANNEL_SCAN_LIMIT):
+            if not message.caption:
+                continue
+            if compiled.search(message.caption):
+                logger.info(f"✅ Found existing post for '{base_name}' in channel (message_id={message.id})")
+                return message.id
+    except Exception as e:
+        logger.error(f"Error scanning channel for duplicates: {e}")
+    return None
+
+# ================================================================
+# MAIN HANDLERS
+# ================================================================
 
 @Client.on_message(filters.chat(CHANNELS) & MEDIA_FILTER)
 async def media_handler(bot, message):
@@ -347,8 +357,6 @@ async def process_and_send_update(bot, filename, caption):
                 
     except Exception as e:
         logger.exception(f"Processing execution failed: {e}")
-
-# ============ PROCESS WITH LOCK ============
 
 async def _process_with_lock(bot, filename, caption, media_info, base_name):
     if not hasattr(db, 'movie_updates'):
@@ -432,7 +440,33 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
             logger.info(f"❌ Poster NOT found for '{base_name}'. Skipping post creation.")
             return
 
+        # ---------- Check if movie already exists in DB ----------
         existing_movie = await db.movie_updates.find_one({"_id": base_name})
+        
+        # ---------- If not in DB, scan channel for duplicate ----------
+        if not existing_movie:
+            existing_msg_id = await search_channel_for_movie(bot, base_name, year_val)
+            if existing_msg_id:
+                # Found existing post in channel, create DB entry with that message_id
+                movie_doc = {
+                    "_id": base_name,
+                    "files": [file_data],
+                    "poster_url": final_poster,
+                    "rating": rating_val,
+                    "year": year_val,
+                    "tag": media_info["tag"],
+                    "language": final_language,
+                    "message_id": existing_msg_id,
+                    "is_posted": True
+                }
+                try:
+                    await db.movie_updates.insert_one(movie_doc)
+                    logger.info(f"ℹ️ Reused existing channel post for '{base_name}' (message_id={existing_msg_id})")
+                except DuplicateKeyError:
+                    await db.movie_updates.update_one({"_id": base_name}, {"$push": {"files": file_data}})
+                return
+
+        # ---------- Normal flow: If movie exists, update; else create new post ----------
         if existing_movie:
             file_exists = any(f.get("filename") == filename for f in existing_movie.get("files", []))
             
@@ -457,6 +491,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 await send_movie_update(bot, base_name, is_update=True)
             return
 
+        # ---------- New movie (not in DB and not found in channel) ----------
         movie_doc = {
             "_id": base_name,
             "files": [file_data],
@@ -481,7 +516,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
     except Exception as e:
         logger.error(f"Error in backend lock verification process: {e}")
 
-# ============ SEND MOVIE UPDATE (FIXED FOR SERIES) ============
+# ============ SEND MOVIE UPDATE ============
 
 async def send_movie_update(bot, base_name, is_update=False):
     try:
@@ -490,7 +525,10 @@ async def send_movie_update(bot, base_name, is_update=False):
             return None
 
         text = generate_movie_message(movie_doc, base_name)
+        
+        # ✅ UPDATED BUTTON TEXT: Changed to ♻️ 𝐉𝐎𝐈𝐍 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 𝐆𝐑𝐎𝐔𝐏 ♻️
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton(text='♻️ 𝐉𝐎𝐈𝐍 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 𝐆𝐑𝐎𝐔𝐏 ♻️', url="https://t.me/+l-EIo3NnnJAxODE9")]])
+        
         poster_url = movie_doc.get("poster_url")
 
         if not poster_url:
@@ -501,7 +539,6 @@ async def send_movie_update(bot, base_name, is_update=False):
 
         # --- UPDATE CASE (New Episode) ---
         if is_update and movie_doc.get("message_id"):
-            # Generate new poster with title overlay
             image_bytes = await create_title_only_poster(poster_url, base_name)
             if image_bytes:
                 media = InputMediaPhoto(media=image_bytes, caption=text, parse_mode=enums.ParseMode.HTML)
@@ -519,10 +556,9 @@ async def send_movie_update(bot, base_name, is_update=False):
                     return await send_movie_update(bot, base_name, is_update)
                 except MessageIdInvalid:
                     logger.warning(f"Message ID invalid for {base_name}, will send new.")
-                    is_update = False  # fallback to new send
+                    is_update = False
                 except Exception as e:
                     logger.error(f"Edit media error: {e}")
-                    # Try to at least update caption
                     try:
                         sent_msg = await bot.edit_message_caption(
                             chat_id=MOVIE_UPDATE_CHANNEL,
@@ -534,7 +570,6 @@ async def send_movie_update(bot, base_name, is_update=False):
                     except Exception:
                         pass
             else:
-                # Fallback: only caption
                 try:
                     sent_msg = await bot.edit_message_caption(
                         chat_id=MOVIE_UPDATE_CHANNEL,
@@ -555,7 +590,6 @@ async def send_movie_update(bot, base_name, is_update=False):
             if sent_msg:
                 return sent_msg
             else:
-                # If editing failed completely, DO NOT send new post (avoid duplicates)
                 logger.warning(f"Update failed for {base_name}, not creating duplicate.")
                 return None
 
@@ -600,12 +634,11 @@ async def send_movie_update(bot, base_name, is_update=False):
         logger.error(f"Failed to push update layout: {e}")
     return None
 
-# ============ AI DOUBLE CHECK & AUTO CORRECTION ENGINE ============
+# ============ AI DOUBLE CHECK & AUTO CORRECTION ============
 
 async def verify_and_correct_post_with_ai(bot, message_id: int, base_name: str, buttons):
     try:
-        await asyncio.sleep(60)  # 1 ਮਿੰਟ ਬਾਅਦ
-        
+        await asyncio.sleep(60)
         movie_doc = await db.movie_updates.find_one({"_id": base_name})
         if not movie_doc or not movie_doc.get("poster_url"):
             return
@@ -616,7 +649,6 @@ async def verify_and_correct_post_with_ai(bot, message_id: int, base_name: str, 
             live_msg = await bot.get_messages(chat_id=MOVIE_UPDATE_CHANNEL, message_ids=message_id)
             if isinstance(live_msg, list) and live_msg:
                 live_msg = live_msg[0]
-                
             live_text = live_msg.caption if live_msg else ""
             
             if live_text and live_text.strip() == correct_text.strip():
@@ -629,7 +661,7 @@ async def verify_and_correct_post_with_ai(bot, message_id: int, base_name: str, 
                 caption=correct_text,
                 reply_markup=buttons,
                 parse_mode=enums.ParseMode.HTML
-                )
+            )
             logger.info(f"✅ AI successfully auto-corrected post ID {message_id}!")
         except MessageNotModified:
             pass 
