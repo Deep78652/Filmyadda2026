@@ -8,27 +8,20 @@ import textwrap
 from datetime import datetime
 from collections import defaultdict
 import urllib.parse
-from typing import Optional, Tuple, Dict, List
-from bs4 import BeautifulSoup
-
-# Pillow (PIL) for image editing
+from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from pyrogram.errors import MessageIdInvalid, MessageNotModified, FloodWait
-from pymongo.errors import PyMongoError, DuplicateKeyError
+from pymongo.errors import DuplicateKeyError
 
 # Plugin & Database Imports
-from plugins.Dreamxfutures.Imdbposter import get_movie_detailsx, fetch_image, get_movie_details
+from plugins.Dreamxfutures.Imdbposter import get_movie_detailsx, get_movie_details
 from database.users_chats_db import db
 from database.ia_filterdb import save_file
-from utils import temp
-from Script import script
 from info import (
-    CHANNELS, MOVIE_UPDATE_CHANNEL, LINK_PREVIEW, ABOVE_PREVIEW, 
-    BAD_WORDS, LANDSCAPE_POSTER, TMDB_POSTER, NOR_IMG, IMDB_TEMPLATE,
-    TMDB_API_KEY, LOG_CHANNEL  # Add LOG_CHANNEL if defined in info.py
+    CHANNELS, MOVIE_UPDATE_CHANNEL, BAD_WORDS, LANDSCAPE_POSTER, TMDB_POSTER
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +56,6 @@ IGNORE_WORDS = {
     "10bit", "10-bit", "8bit", "8-bit"
 } | BAD_WORDS
 
-# ============ TMDB LANGUAGE CODE TO FULL NAME MAPPING ============
 TMDB_LANG_MAP = {
     "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "ml": "Malayalam",
     "kn": "Kannada", "en": "English", "bn": "Bengali", "mr": "Marathi",
@@ -406,50 +398,27 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
             logger.info(f"❌ Poster NOT found for '{base_name}'. Skipping post creation.")
             return
 
-        # ---------- Check if movie already exists in DB ----------
+        # ---------- Check if movie exists in DB ----------
         existing_movie = await db.movie_updates.find_one({"_id": base_name})
         
-        # If exists, verify if the message_id is still valid
-        if existing_movie:
-            msg_id = existing_movie.get("message_id")
-            if msg_id:
-                try:
-                    # Try to get the message to see if it still exists
-                    await bot.get_messages(chat_id=MOVIE_UPDATE_CHANNEL, message_ids=msg_id)
-                    # If success, message exists; proceed with update
-                except MessageIdInvalid:
-                    # Post deleted, we need to repost
-                    logger.warning(f"Message ID {msg_id} for '{base_name}' is invalid/deleted. Will repost.")
-                    existing_movie["message_id"] = None  # mark as None so it will send new
-                except Exception as e:
-                    logger.error(f"Error checking message for {base_name}: {e}")
-                    # If any other error, we assume it's invalid and repost
-                    existing_movie["message_id"] = None
-            
-            # If message_id is None (either never set or invalid), we will send new post
-            if existing_movie.get("message_id") is None:
-                # Remove the old document (or we can just update it)
-                # We'll treat it as new movie but keep the old files? Actually we want to keep old files.
-                # So we can just set message_id to None and let the new post flow.
-                # We'll update the document with the new message_id after sending.
-                # We'll also clear the message_id in DB so that it can be set later.
-                await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": None}})
-                # Now proceed as if it's a new movie (but we have the existing movie doc)
-                # We'll use the existing_movie doc but with message_id None.
-                existing_movie["message_id"] = None
-                # Continue to new post flow
-                # We'll set is_update=False but we also need to handle the files.
-                # Actually we can let the code below handle it as if it's a new movie?
-                # But we already have files in the doc. We should just send a new post and update the message_id.
-                # Let's just call send_movie_update with is_update=False but with the existing doc.
-                # We'll update the doc with new message_id after sending.
-                # For simplicity, we'll just call send_movie_update with is_update=False.
-                msg = await send_movie_update(bot, base_name, is_update=False)
+        # ---------- If exists, verify if post still exists in channel ----------
+        post_exists = False
+        if existing_movie and existing_movie.get("message_id"):
+            try:
+                # Try to get the message from the channel
+                msg = await bot.get_messages(chat_id=MOVIE_UPDATE_CHANNEL, message_ids=existing_movie["message_id"])
                 if msg:
-                    await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
-                return
-
-            # If message_id is valid, proceed with normal update
+                    post_exists = True
+                    logger.info(f"✅ Post found for '{base_name}' (message_id={existing_movie['message_id']})")
+            except MessageIdInvalid:
+                logger.warning(f"⚠️ Post for '{base_name}' (ID {existing_movie['message_id']}) no longer exists in channel. Will repost.")
+                post_exists = False
+            except Exception as e:
+                logger.error(f"Error checking post for '{base_name}': {e}")
+                post_exists = False  # Assume doesn't exist
+        
+        # ---------- If post exists, update it ----------
+        if post_exists:
             file_exists = any(f.get("filename") == filename for f in existing_movie.get("files", []))
             
             update_fields = {}
@@ -472,8 +441,33 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 await db.movie_updates.update_one({"_id": base_name}, {"$set": update_fields})
                 await send_movie_update(bot, base_name, is_update=True)
             return
-
-        # ---------- New movie (not in DB) ----------
+        
+        # ---------- Post doesn't exist OR movie not in DB: Create new post ----------
+        if existing_movie:
+            # Movie exists in DB but post is gone: we need to reset message_id and post again
+            # We'll update the existing doc with new file and reset message_id
+            update_fields = {"message_id": None}
+            if existing_movie.get("rating") == "N/A" and rating_val != "N/A":
+                update_fields["rating"] = rating_val
+            if not existing_movie.get("year") and year_val:
+                update_fields["year"] = year_val
+            if not existing_movie.get("poster_url") and final_poster:
+                update_fields["poster_url"] = final_poster
+            if existing_movie.get("language") != final_language and final_language != "N/A":
+                update_fields["language"] = final_language
+            
+            await db.movie_updates.update_one(
+                {"_id": base_name},
+                {"$push": {"files": file_data}, "$set": update_fields}
+            )
+            logger.info(f"🔄 Reposting '{base_name}' because post was deleted from channel.")
+            # Now send new post
+            msg = await send_movie_update(bot, base_name, is_update=False)
+            if msg:
+                await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
+            return
+        
+        # ---------- New movie: Create document and send new post ----------
         movie_doc = {
             "_id": base_name,
             "files": [file_data],
@@ -492,8 +486,11 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
             if msg:
                 await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
         except DuplicateKeyError:
-            await db.movie_updates.update_one({"_id": base_name}, {"$push": {"files": file_data}})
-            await send_movie_update(bot, base_name, is_update=True)
+            # Race condition: another process inserted it, just update
+            await db.movie_updates.update_one({"_id": base_name}, {"$push": {"files": file_data}, "$set": {"message_id": None}})
+            msg = await send_movie_update(bot, base_name, is_update=False)
+            if msg:
+                await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
 
     except Exception as e:
         logger.error(f"Error in backend lock verification process: {e}")
@@ -510,14 +507,13 @@ async def send_movie_update(bot, base_name, is_update=False):
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton(text='♻️ 𝐉𝐎𝐈𝐍 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 𝐆𝐑𝐎𝐔𝐏 ♻️', url="https://t.me/+l-EIo3NnnJAxODE9")]])
         
         poster_url = movie_doc.get("poster_url")
-
         if not poster_url or not poster_url.startswith(('http://', 'https://')):
             logger.info(f"⚠️ Invalid poster URL for '{base_name}'. Skipping post creation.")
             return None
 
         sent_msg = None
 
-        # --- UPDATE CASE (New Episode) ---
+        # --- UPDATE CASE (Post exists in channel, just edit) ---
         if is_update and movie_doc.get("message_id"):
             image_bytes = await create_title_only_poster(poster_url, base_name)
             if image_bytes:
@@ -574,7 +570,6 @@ async def send_movie_update(bot, base_name, is_update=False):
                 return None
 
         # --- NEW POST CASE ---
-        # First try with overlay poster
         image_bytes = await create_title_only_poster(poster_url, base_name)
         try:
             if image_bytes:
@@ -586,7 +581,6 @@ async def send_movie_update(bot, base_name, is_update=False):
                     parse_mode=enums.ParseMode.HTML
                 )
             else:
-                # Fallback to direct URL
                 sent_msg = await bot.send_photo(
                     chat_id=MOVIE_UPDATE_CHANNEL,
                     photo=poster_url,
@@ -599,7 +593,6 @@ async def send_movie_update(bot, base_name, is_update=False):
             return await send_movie_update(bot, base_name, is_update)
         except Exception as e:
             logger.error(f"New send failed: {e}")
-            # Try once more with direct URL if overlay failed
             try:
                 sent_msg = await bot.send_photo(
                     chat_id=MOVIE_UPDATE_CHANNEL,
@@ -702,4 +695,4 @@ def generate_movie_message(movie_doc, base_name) -> str:
         f"⭐ IMDb: {rating_str}\n\n"
         f"➡ Audio Track: 🔊 {language_str}\n\n"
         f"✅ Added"
-)
+    )
