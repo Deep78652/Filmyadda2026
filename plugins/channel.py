@@ -38,6 +38,7 @@ POSTED_MOVIES = set()
 MAX_CACHE_SIZE = 500
 locks = defaultdict(asyncio.Lock)
 
+# ============ IGNORED WORDS (includes subtitle-related) ============
 IGNORE_WORDS = {
     "rarbg", "dub", "sub", "sample", "mkv", "aac", "combined", "mp4", "avi",
     "action", "adventure", "animation", "biography", "comedy", "crime", 
@@ -53,9 +54,12 @@ IGNORE_WORDS = {
     "japanese", "nf", "netflix", "sonyliv", "sony", "sliv", "amzn", "prime", 
     "primevideo", "hotstar", "zee5", "jio", "jiohotstar", "jhs", "aha", "hbo", "paramount", 
     "apple", "hoichoi", "sunnxt", "viki", "x264", "x265", "avc", "dd5", "dovi", "hdr",
-    "10bit", "10-bit", "8bit", "8-bit"
+    "10bit", "10-bit", "8bit", "8-bit",
+    # 🟢 Subtitle-related – will be ignored during language extraction
+    "subtitle", "subtitles", "srt", "subs"
 } | BAD_WORDS
 
+# ============ LANGUAGE MAPPINGS ============
 TMDB_LANG_MAP = {
     "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "ml": "Malayalam",
     "kn": "Kannada", "en": "English", "bn": "Bengali", "mr": "Marathi",
@@ -77,6 +81,19 @@ CAPTION_LANGUAGES = {
     "mar": "Marathi", "marathi": "Marathi", "guj": "Gujarati", "gujarati": "Gujarati",
     "urd": "Urdu", "urdu": "Urdu", "kor": "Korean", "korean": "Korean",
     "jpn": "Japanese", "japanese": "Japanese",
+    # Additional languages (if needed)
+    "spa": "Spanish", "spanish": "Spanish",
+    "fre": "French", "french": "French",
+    "ger": "German", "german": "German",
+    "chi": "Chinese", "chinese": "Chinese",
+    "rus": "Russian", "russian": "Russian",
+    "ita": "Italian", "italian": "Italian",
+    "por": "Portuguese", "portuguese": "Portuguese",
+    "ara": "Arabic", "arabic": "Arabic",
+    "dut": "Dutch", "dutch": "Dutch",
+    "swe": "Swedish", "swedish": "Swedish",
+    "pol": "Polish", "polish": "Polish",
+    "tur": "Turkish", "turkish": "Turkish",
 }
 
 OTT_PLATFORMS = {
@@ -88,6 +105,7 @@ OTT_PLATFORMS = {
     "hoichoi": "Hoichoi", "sunnxt": "Sun NXT", "viki": "Viki"
 }
 
+# ============ PATTERNS ============
 CLEAN_PATTERN = re.compile(r'@[^ \n\r\t\.,:;!?()\[\]{}<>\\/"\'=_%]+|\bwww\.[^\s\]\)]+|\([\@^]+\)|\[[\@^]+\]')
 NORMALIZE_PATTERN = re.compile(r"[._\-\+]+|[()\[\]{}:;'–!,.?]")
 QUALITY_PATTERN = re.compile(
@@ -208,12 +226,31 @@ def remove_ignored_words(text: str) -> str:
         cleaned_words.append(word)
     return " ".join(cleaned_words)
 
+# ============================================================
+# 🟢 IMPROVED LANGUAGE EXTRACTION – IGNORES SUBTITLE KEYWORDS
+# ============================================================
 def extract_languages_from_text(text: str) -> set:
+    """Extract languages from filename, ignoring subtitle-related tokens."""
+    # Keywords that indicate subtitle – we will skip these tokens
+    SUBTITLE_KEYWORDS = {"sub", "subtitle", "subtitles", "srt", "subs"}
+    
     found = set()
     text_lower = text.lower()
-    for lang_key, lang_name in CAPTION_LANGUAGES.items():
-        if re.search(rf'\b{re.escape(lang_key)}\b', text_lower):
-            found.add(lang_name)
+    # Replace common separators with space
+    for sep in ['.', '_', '-', '+', ' ', '(', ')', '[', ']', '{', '}', ';', ',']:
+        text_lower = text_lower.replace(sep, ' ')
+    tokens = text_lower.split()
+    
+    for token in tokens:
+        # 🟢 Skip if token is subtitle-related
+        if token in SUBTITLE_KEYWORDS:
+            continue
+        # Check if token matches any language key (e.g., "hindi", "tamil")
+        for lang_key, lang_name in CAPTION_LANGUAGES.items():
+            # If the token contains the key (e.g., "hindidub" -> "hindi")
+            if lang_key in token:
+                found.add(lang_name)
+                break
     return found
 
 def extract_media_info(filename: str, caption: str):
@@ -316,6 +353,9 @@ async def process_and_send_update(bot, filename, caption):
     except Exception as e:
         logger.exception(f"Processing execution failed: {e}")
 
+# ============================================================
+# 🟢 MODIFIED: _process_with_lock (no 48h check, improved language)
+# ============================================================
 async def _process_with_lock(bot, filename, caption, media_info, base_name):
     if not hasattr(db, 'movie_updates'):
         db.movie_updates = db.db.movie_updates
@@ -378,18 +418,27 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
 
         year_val = year_val or None
         
-        # ✅ Language: TMDB original_language ਨੂੰ ਪ੍ਰਾਥਮਿਕਤਾ
-        final_language = media_info["language"]
-        if tmdb_language_override and tmdb_language_override != "N/A":
-            if final_language == "N/A" or final_language == "Hindi" or len(final_language.split(",")) <= 1:
-                final_language = tmdb_language_override
-            else:
-                existing = set(l.strip() for l in final_language.split(","))
-                existing.add(tmdb_language_override)
-                final_language = ", ".join(sorted(existing))
-        elif final_language == "N/A":
-            final_language = "Hindi"
+        # ============================================================
+        # 🟢 IMPROVED LANGUAGE LOGIC – Filename first, TMDB adds only if missing
+        # ============================================================
+        # Step 1: Get languages from filename (already extracted)
+        lang_set = set()
+        raw_lang = media_info["language"]  # string like "Hindi, Tamil" or "N/A"
+        if raw_lang != "N/A":
+            lang_set.update(l.strip() for l in raw_lang.split(",") if l.strip())
         
+        # Step 2: Add TMDB original language (if available and not already present)
+        if tmdb_language_override and tmdb_language_override != "N/A":
+            lang_set.add(tmdb_language_override)  # set will ignore duplicates
+        
+        # Step 3: Fallback if no languages found
+        if not lang_set:
+            if tmdb_language_override and tmdb_language_override != "N/A":
+                lang_set.add(tmdb_language_override)
+            else:
+                lang_set.add("Hindi")   # default
+        
+        final_language = ", ".join(sorted(lang_set))
         file_data["language"] = final_language
         
         final_poster = await get_landscape_poster_only(base_name, is_series)
@@ -405,7 +454,6 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
         post_exists = False
         if existing_movie and existing_movie.get("message_id"):
             try:
-                # Try to get the message from the channel
                 msg = await bot.get_messages(chat_id=MOVIE_UPDATE_CHANNEL, message_ids=existing_movie["message_id"])
                 if msg:
                     post_exists = True
@@ -417,7 +465,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 logger.error(f"Error checking post for '{base_name}': {e}")
                 post_exists = False  # Assume doesn't exist
         
-        # ---------- If post exists, update it ----------
+        # ---------- If post exists, update it (no time check, auto-delete ensures it's <24h) ----------
         if post_exists:
             file_exists = any(f.get("filename") == filename for f in existing_movie.get("files", []))
             
@@ -431,22 +479,27 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
             if existing_movie.get("language") != final_language and final_language != "N/A":
                 update_fields["language"] = final_language
 
+            # Update DB
             if not file_exists:
                 await db.movie_updates.update_one(
                     {"_id": base_name}, 
                     {"$push": {"files": file_data}, "$set": update_fields} if update_fields else {"$push": {"files": file_data}}
                 )
-                await send_movie_update(bot, base_name, is_update=True)
             elif update_fields:
                 await db.movie_updates.update_one({"_id": base_name}, {"$set": update_fields})
-                await send_movie_update(bot, base_name, is_update=True)
+            
+            # ✅ Since post is still in channel, simply edit it (within auto-delete window)
+            logger.info(f"✏️ Editing existing post for '{base_name}' (within auto-delete window).")
+            await send_movie_update(bot, base_name, is_update=True)
             return
         
         # ---------- Post doesn't exist OR movie not in DB: Create new post ----------
         if existing_movie:
-            # Movie exists in DB but post is gone: we need to reset message_id and post again
-            # We'll update the existing doc with new file and reset message_id
-            update_fields = {"message_id": None}
+            # Movie exists in DB but post is gone (likely auto-deleted). Repost with fresh timestamp.
+            update_fields = {
+                "message_id": None,
+                "first_posted_at": datetime.now()  # reset timestamp for new post
+            }
             if existing_movie.get("rating") == "N/A" and rating_val != "N/A":
                 update_fields["rating"] = rating_val
             if not existing_movie.get("year") and year_val:
@@ -460,8 +513,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 {"_id": base_name},
                 {"$push": {"files": file_data}, "$set": update_fields}
             )
-            logger.info(f"🔄 Reposting '{base_name}' because post was deleted from channel.")
-            # Now send new post
+            logger.info(f"🔄 Reposting '{base_name}' because old post was auto-deleted.")
             msg = await send_movie_update(bot, base_name, is_update=False)
             if msg:
                 await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
@@ -477,7 +529,8 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
             "tag": media_info["tag"],
             "language": final_language,
             "message_id": None,
-            "is_posted": True
+            "is_posted": True,
+            "first_posted_at": datetime.now()
         }
         
         try:
@@ -487,7 +540,10 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name):
                 await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
         except DuplicateKeyError:
             # Race condition: another process inserted it, just update
-            await db.movie_updates.update_one({"_id": base_name}, {"$push": {"files": file_data}, "$set": {"message_id": None}})
+            await db.movie_updates.update_one(
+                {"_id": base_name},
+                {"$push": {"files": file_data}, "$set": {"message_id": None, "first_posted_at": datetime.now()}}
+            )
             msg = await send_movie_update(bot, base_name, is_update=False)
             if msg:
                 await db.movie_updates.update_one({"_id": base_name}, {"$set": {"message_id": msg.id}})
@@ -513,7 +569,7 @@ async def send_movie_update(bot, base_name, is_update=False):
 
         sent_msg = None
 
-        # --- UPDATE CASE (Post exists in channel, just edit) ---
+        # --- UPDATE CASE ---
         if is_update and movie_doc.get("message_id"):
             image_bytes = await create_title_only_poster(poster_url, base_name)
             if image_bytes:
@@ -656,9 +712,7 @@ async def verify_and_correct_post_with_ai(bot, message_id: int, base_name: str, 
         logger.error(f"Critical error in AI Double-Check Engine: {e}")
 
 # ==================================================
-# 🟢 GENERATE MOVIE MESSAGE - FINAL VERSION
-# ✅ English Caption | ❌ Removed "/10" from Rating
-# ✅ Audio Track shows only filename languages
+# 🟢 GENERATE MOVIE MESSAGE (unchanged)
 # ==================================================
 
 def generate_movie_message(movie_doc, base_name) -> str:
@@ -695,4 +749,4 @@ def generate_movie_message(movie_doc, base_name) -> str:
         f"⭐ IMDb: {rating_str}\n\n"
         f"➡ Audio Track: 🔊 {language_str}\n\n"
         f"✅ Added"
-    )
+)
