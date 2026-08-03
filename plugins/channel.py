@@ -47,9 +47,9 @@ SPIDY_API_URL = "https://poster-api.ispidy.com/v1/fetch"
 FANART_API_KEY = "cfa9dc054d221b8d107f8411cd20b13f"
 FANART_API_URL = "https://webservice.fanart.tv/v3/movies"
 
-# OMDb API
-OMDB_API_KEY = "5f7182e"
-OMDB_API_URL = "http://www.omdbapi.com/"
+# OMDb API - ⚠️ ਹੁਣ ਵਰਤੋਂ ਨਹੀਂ ਕੀਤੀ ਜਾ ਰਹੀ (ਖੜਾ ਪੋਸਟਰ ਬੰਦ ਕਰਨ ਲਈ)
+# OMDB_API_KEY = "5f7182e"
+# OMDB_API_URL = "http://www.omdbapi.com/"
 
 # OpenPosterDB API (optional – if hosted)
 OPENPOSTERDB_API_KEY = "t0-free-rpdb"
@@ -130,7 +130,7 @@ EPISODE_CLEAN_PATTERN = re.compile(r'\b(S\d{1,2}|E\d{1,3}|Ep\d{1,3}|Episode\s*\d
 
 MEDIA_FILTER = filters.document | filters.video | filters.audio
 
-# ============ POSTER SOURCES ============
+# ============ POSTER SOURCES (ONLY LANDSCAPE) ============
 
 async def fetch_cinemeta_ai_poster(query: str, is_series: bool = False) -> Optional[str]:
     """Fetch poster from Stremio Cinemeta (fallback)."""
@@ -152,32 +152,7 @@ async def fetch_cinemeta_ai_poster(query: str, is_series: bool = False) -> Optio
         logger.error(f"Cinemeta AI Metadata Error: {e}")
     return None
 
-async def fetch_omdb_poster(query: str, year: Optional[str] = None) -> Optional[str]:
-    """Fetch poster from OMDb API."""
-    try:
-        session = await get_session()
-        params = {
-            "apikey": OMDB_API_KEY,
-            "t": query,
-            "type": "movie"
-        }
-        if year and year != "N/A":
-            params["y"] = year
-        async with session.get(OMDB_API_URL, params=params, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("Response") == "True":
-                    poster = data.get("Poster")
-                    if poster and poster.startswith(('http://', 'https://')) and poster != "N/A":
-                        logger.info(f"✅ OMDb: Found poster for '{query}'")
-                        return poster
-                else:
-                    logger.info(f"❌ OMDb: No result for '{query}'")
-            else:
-                logger.warning(f"⚠️ OMDb: Status {resp.status} for '{query}'")
-    except Exception as e:
-        logger.error(f"❌ OMDb error for '{query}': {e}")
-    return None
+# ❌ OMDb fetch function (fetch_omdb_poster) ਨੂੰ ਪੂਰੀ ਤਰ੍ਹਾਂ ਹਟਾ ਦਿੱਤਾ ਗਿਆ — ਕਿਉਂਕਿ ਇਹ ਖੜਾ (portrait) ਪੋਸਟਰ ਦਿੰਦਾ ਹੈ।
 
 async def fetch_fanart_landscape_poster(tmdb_id: str) -> Optional[str]:
     """Fetch landscape (moviebackground) from fanart.tv using TMDB ID."""
@@ -212,7 +187,6 @@ async def fetch_openposterdb_landscape(tmdb_id: str) -> Optional[str]:
         return None
     try:
         session = await get_session()
-        # Try hosted endpoint
         url = f"{OPENPOSTERDB_API_URL}/t0-free-rpdb/tmdb/backdrop-default/{tmdb_id}.jpg"
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
@@ -224,9 +198,6 @@ async def fetch_openposterdb_landscape(tmdb_id: str) -> Optional[str]:
         logger.error(f"❌ OpenPosterDB error for TMDB ID {tmdb_id}: {e}")
     return None
 
-# ============================================================
-# 🟢 SPIDY API – WITH EXACT TITLE MATCH & CLEAN QUERY
-# ============================================================
 async def fetch_spidy_landscape_poster(query: str, is_series: bool = False, year: Optional[str] = None) -> Optional[str]:
     """
     Fetch landscape poster from Spidy Poster API.
@@ -298,11 +269,12 @@ async def fetch_spidy_landscape_poster(query: str, is_series: bool = False, year
     return None
 
 # ============================================================
-# 🟢 ORCHESTRATOR – ALL SOURCES WITH FALLBACK
+# 🟢 MODIFIED: ORCHESTRATOR – ONLY LANDSCAPE SOURCES (OMDb HATAYA)
 # ============================================================
 async def get_landscape_poster_only(movie_name: str, is_series: bool = False, year: Optional[str] = None, tmdb_id: Optional[str] = None) -> Optional[str]:
     """
-    Try sources in order: Spidy API → Fanart.tv → OMDb → TMDB → Cinemeta → OpenPosterDB.
+    Try sources in order: Spidy API → TMDB → Cinemeta → Fanart.tv → OpenPosterDB.
+    ⛔ OMDb ਨੂੰ ਪੂਰੀ ਤਰ੍ਹਾਂ ਹਟਾ ਦਿੱਤਾ ਗਿਆ ਤਾਂ ਜੋ ਖੜਾ (portrait) ਪੋਸਟਰ ਕਦੇ ਨਾ ਆਵੇ।
     """
     # 1️⃣ Spidy Poster API (with exact title priority)
     spidy_backdrop = await fetch_spidy_landscape_poster(movie_name, is_series, year)
@@ -310,47 +282,42 @@ async def get_landscape_poster_only(movie_name: str, is_series: bool = False, ye
         logger.info(f"✅ Spidy poster found for '{movie_name}'")
         return spidy_backdrop
 
-    # 2️⃣ Fanart.tv (if TMDB ID available)
+    # 2️⃣ TMDB (Backdrop – HD Landscape)
+    if LANDSCAPE_POSTER and TMDB_POSTER:
+        try:
+            details = await get_movie_detailsx(movie_name)
+            if details and details.get('backdrop_url'):
+                backdrop = details['backdrop_url']
+                # Original size ਲਈ URL ਨੂੰ ਠੀਕ ਕਰੋ
+                if "t/p/" in backdrop:
+                    backdrop = re.sub(r'/t/p/w\d+/', '/t/p/original/', backdrop)
+                    backdrop = re.sub(r'/t/p/w\d+x\d+/', '/t/p/original/', backdrop)
+                logger.info(f"✅ TMDB backdrop found for '{movie_name}'")
+                return backdrop
+        except Exception as e:
+            logger.error(f"TMDB backdrop error: {e}")
+
+    # 3️⃣ Stremio Cinemeta (AI Fallback – Landscape)
+    ai_backdrop = await fetch_cinemeta_ai_poster(movie_name, is_series)
+    if ai_backdrop:
+        logger.info(f"✅ Cinemeta poster found for '{movie_name}'")
+        return ai_backdrop
+
+    # 4️⃣ Fanart.tv (moviebackground – Landscape)
     if tmdb_id:
         fanart_backdrop = await fetch_fanart_landscape_poster(tmdb_id)
         if fanart_backdrop:
             logger.info(f"✅ Fanart.tv poster found for '{movie_name}'")
             return fanart_backdrop
 
-    # 3️⃣ OMDb API
-    omdb_poster = await fetch_omdb_poster(movie_name, year)
-    if omdb_poster:
-        logger.info(f"✅ OMDb poster found for '{movie_name}'")
-        return omdb_poster
-
-    # 4️⃣ TMDB (if LANDSCAPE_POSTER is enabled)
-    if LANDSCAPE_POSTER:
-        try:
-            details = await get_movie_detailsx(movie_name)
-            if details and details.get('backdrop_url'):
-                backdrop = details['backdrop_url']
-                if "t/p/" in backdrop:
-                    backdrop = re.sub(r'/t/p/w\d+/', '/t/p/original/', backdrop)
-                    backdrop = re.sub(r'/t/p/w\d+x\d+/', '/t/p/original/', backdrop)
-                logger.info(f"✅ TMDB poster found for '{movie_name}'")
-                return backdrop
-        except Exception as e:
-            logger.error(f"TMDB backdrop error: {e}")
-
-    # 5️⃣ Stremio Cinemeta (AI Fallback)
-    ai_backdrop = await fetch_cinemeta_ai_poster(movie_name, is_series)
-    if ai_backdrop:
-        logger.info(f"✅ Cinemeta poster found for '{movie_name}'")
-        return ai_backdrop
-
-    # 6️⃣ OpenPosterDB (last resort – only if TMDB ID available)
+    # 5️⃣ OpenPosterDB (backdrop-default – Landscape)
     if tmdb_id:
         openposter_backdrop = await fetch_openposterdb_landscape(tmdb_id)
         if openposter_backdrop:
             logger.info(f"✅ OpenPosterDB poster found for '{movie_name}'")
             return openposter_backdrop
 
-    logger.info(f"❌ No poster found for '{movie_name}' from any source")
+    logger.info(f"❌ No landscape poster found for '{movie_name}' from any source")
     return None
 
 # ============ CLEANING AND EXTRACTION FUNCTIONS ============
@@ -391,9 +358,6 @@ def extract_languages_from_text(text: str) -> set:
                 break
     return found
 
-# ============================================================
-# 🟢 MODIFIED: extract_media_info – adds normalized_key
-# ============================================================
 def extract_media_info(filename: str, caption: str):
     """Extract base name, year, language, quality, and normalized key."""
     filename_cleaned = clean_mentions_links(filename)
@@ -499,9 +463,6 @@ async def process_and_send_update(bot, filename, caption):
     except Exception as e:
         logger.exception(f"Processing execution failed: {e}")
 
-# ============================================================
-# 🟢 MODIFIED: _process_with_lock – uses normalized_key as _id
-# ============================================================
 async def _process_with_lock(bot, filename, caption, media_info, base_name, normalized_key):
     if not hasattr(db, 'movie_updates'):
         db.movie_updates = db.db.movie_updates
@@ -586,7 +547,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name, norm
         final_language = ", ".join(sorted(lang_set))
         file_data["language"] = final_language
         
-        # 🟢 Get Poster – All Sources
+        # 🟢 Get Poster – Only Landscape Sources (OMDb EXCLUDED)
         final_poster = await get_landscape_poster_only(base_name, is_series, year_val, str(tmdb_id) if tmdb_id else None)
 
         if not final_poster:
@@ -665,7 +626,7 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name, norm
         # ---------- New movie ----------
         movie_doc = {
             "_id": normalized_key,
-            "title": base_name,          # 🟢 Store display title
+            "title": base_name,
             "files": [file_data],
             "poster_url": final_poster,
             "rating": rating_val,
@@ -694,16 +655,13 @@ async def _process_with_lock(bot, filename, caption, media_info, base_name, norm
     except Exception as e:
         logger.error(f"Error in backend lock verification process: {e}")
 
-# ============================================================
-# 🟢 MODIFIED: send_movie_update – uses normalized_key to fetch doc
-# ============================================================
+# ============ SEND MOVIE UPDATE (NO RESIZE, ORIGINAL LANDSCAPE) ============
 async def send_movie_update(bot, normalized_key, is_update=False):
     try:
         movie_doc = await db.movie_updates.find_one({"_id": normalized_key})
         if not movie_doc:
             return None
 
-        # Get display title from stored field
         display_title = movie_doc.get("title", normalized_key)
         text = generate_movie_message(movie_doc, display_title)
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton(text='♻️ 𝐉𝐎𝐈𝐍 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 𝐆𝐑𝐎𝐔𝐏 ♻️', url="https://t.me/+l-EIo3NnnJAxODE9")]])
@@ -751,11 +709,11 @@ async def send_movie_update(bot, normalized_key, is_update=False):
                 logger.warning(f"Update failed for {display_title}, not creating duplicate.")
                 return None
 
-        # --- NEW POST CASE ---
+        # --- NEW POST CASE (SENDING ORIGINAL LANDSCAPE URL DIRECTLY) ---
         try:
             sent_msg = await bot.send_photo(
                 chat_id=MOVIE_UPDATE_CHANNEL,
-                photo=poster_url,
+                photo=poster_url,  # 🟢 ਇਹ URL ਪਹਿਲਾਂ ਹੀ Landscape ਹੈ (OMDb ਹਟਾ ਦਿੱਤਾ)
                 caption=text,
                 reply_markup=buttons,
                 parse_mode=enums.ParseMode.HTML
@@ -818,7 +776,7 @@ async def verify_and_correct_post_with_ai(bot, message_id: int, normalized_key: 
         logger.error(f"Critical error in AI Double-Check Engine: {e}")
 
 # ==================================================
-# 🟢 MODIFIED: generate_movie_message – accepts display_title explicitly
+# 🟢 generate_movie_message
 # ==================================================
 def generate_movie_message(movie_doc, display_title) -> str:
     all_languages = set()
